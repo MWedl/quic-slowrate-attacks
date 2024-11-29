@@ -1,0 +1,138 @@
+import asyncio
+import itertools
+import json
+from pathlib import Path
+import ssl
+import sys
+
+import click
+import time
+import logging
+
+from aioquic.asyncio import connect
+from aioquic.h3.connection import H3_ALPN
+from aioquic.quic.configuration import QuicConfiguration
+
+from aioquic_http3_client import HttpClient, URL
+from aioquic.quic.logger import QuicLogger
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(name)s:%(message)s', datefmt='%Y-%m-%dT%H:%M:%S')
+
+client_contextmanager = None
+client: HttpClient = None
+
+async def check_h3(i, url):
+    global client, client_contextmanager
+
+    log_secrets = True
+    time_start = time.time()
+    time_connected = None
+    time_response = None
+    time_end = None
+    time_error = None
+    error = None
+    stage = 'connect'
+    quic_logger = None # QuicLogger()
+    try:
+        if not client or not client._connected:
+            if client_contextmanager:
+                await client_contextmanager.__aexit__(None, None, None)
+
+            logging.info('Establishing a new connection')
+            client_contextmanager = connect(
+                host=url.parsed.hostname,
+                port=url.parsed.port or 443,
+                configuration=QuicConfiguration(
+                    alpn_protocols=H3_ALPN,
+                    verify_mode=ssl.VerifyMode.CERT_NONE,
+                    secrets_log_file=(Path(__file__).parent.parent / 'quic_secrets.log').open('a') if log_secrets else None,
+                    quic_logger=quic_logger,
+                ),
+                create_protocol=HttpClient,
+                wait_connected=True,
+            )
+            client = await client_contextmanager.__aenter__()
+            logging.info(f'Connection established {client}')
+
+        time_connected = time.time()
+        stage = 'request'
+        res = await client.get(url.parsed.geturl())
+        time_response = time.time()
+        stage = 'close'
+        time_end = time.time()
+        stage = 'done'
+    except (Exception, asyncio.CancelledError) as ex:
+        error = ex
+        time_error = time.time()
+        if not time_connected:
+            time_connected = time_error
+        if not time_response:
+            time_response = time_error
+        if not time_end:
+            time_end = time_error
+
+    elapsed_total = (time_end - time_start) * 1000
+    elapsed_connect = (time_connected - time_start) * 1000
+    elapsed_response = (time_response - time_connected) * 1000
+    elapsed_close = (time_end - time_response) * 1000
+    result = {
+        'i': i,
+        'elapsed_total': elapsed_total,
+        'elapsed_connect': elapsed_connect,
+        'elapsed_response': elapsed_response,
+        'elapsed_close': elapsed_close,
+        'is_error': bool(error),
+        'error': repr(error) if error else None,
+        'stage': stage,
+        'time_start': time_start,
+        'time_connected': time_connected,
+        'time_response': time_response,
+        'time_end': time_end,
+        'time_error': time_error,
+    }
+    print(json.dumps(result))
+    print(f'{i:03} total={int(elapsed_total):03}ms connect={int(elapsed_connect):03}ms response={int(elapsed_response):03}ms close={int(elapsed_close):03}ms', file=sys.stderr)
+    
+    if quic_logger:
+        (Path(__file__).parent.parent / 'out' / f'qlog_{i}.json').write_text(json.dumps(quic_logger.to_dict(), indent=2))
+
+
+async def check_task(*args, **kwargs):
+    task = check_h3(*args, **kwargs)
+    try:
+        await asyncio.wait_for(task, timeout=60)
+    except TimeoutError:
+        pass
+
+
+
+async def check_loop(url):
+    tasks = []
+    try:
+        for i in itertools.count():
+            # Start task
+            task = asyncio.ensure_future(check_task(i, url))
+            tasks.append(task)
+
+            # Wait
+            await asyncio.sleep(1)
+
+            # Cleanup old tasks
+            for t in tasks:
+                if t.done():
+                    await t
+                    tasks.remove(t)
+    except:
+        logging.exception('Error in check_loop')
+        for t in tasks:
+            t.cancel()
+
+
+@click.command()
+@click.argument('url', type=URL)
+def main(url):
+    asyncio.run(check_loop(url))
+
+
+if __name__ == '__main__':
+    main()
