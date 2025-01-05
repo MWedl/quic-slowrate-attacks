@@ -1,0 +1,7 @@
+services:
+  script:
+    build: .
+    network_mode: "host"
+    volumes:
+      - ./quic_slowrate_attacks:/app/quic_slowrate_attacks
+      - ./quic_secrets.log:/app/quic_secrets.log
